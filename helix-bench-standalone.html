@@ -1,0 +1,2136 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Helix Bench (standalone)</title>
+<style>
+:root{--bg:#0e121b;--card:#161c29;--line:#2a3347;--tx:#e8edf7;--mut:#8b97b3;--ac:#5aa9ff}
+*{box-sizing:border-box}body{margin:0;font:15px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:14px;max-width:880px;margin:auto}
+h1{font-size:20px;margin:4px 0}h2{font-size:15px;margin:0 0 8px;color:var(--ac)}.sub{color:var(--mut);font-size:13px;margin-bottom:12px}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:12px 0}
+canvas{width:100%;height:90px;background:#0b0f17;border-radius:8px;display:block;margin:6px 0}
+button{background:#22304a;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:9px 12px;font:inherit;margin:3px 3px 3px 0}
+button:active{background:var(--ac)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
+.m{background:#0f1521;border-radius:8px;padding:8px}.m b{display:block;font-size:19px}.m span{color:var(--mut);font-size:12px}
+label{display:flex;justify-content:space-between;gap:8px;font-size:13px;color:var(--mut);margin-top:6px}input[type=range]{width:100%}
+select,input[type=text]{width:100%;background:#0f1521;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:8px;font:inherit}
+table{width:100%;border-collapse:collapse;font-size:13px}td{padding:4px 6px;border-bottom:1px solid var(--line)}
+tr.exact td:nth-child(3){color:#7be0a5}tr.substituted td:nth-child(3){color:#ffcf5a}tr.unmappable td:nth-child(3),tr.unknown td:nth-child(3){color:#ff7b7b}
+ul{margin:6px 0 0 18px;padding:0;font-size:13px}.note{color:var(--mut);font-size:12px}#err{color:#ff7b7b}
+</style></head><body>
+<h1>Helix Bench</h1><div class="sub">Standalone build of the bench's own DSP engine. Runs offline in the browser; no install.</div><div id="err"></div>
+<section><h2>Alignment QC (demo take)</h2>
+<canvas id="cvRef" width="840" height="90"></canvas><div class="note">Reference (blue) with tracked pitch (gold)</div>
+<canvas id="cvProc" width="840" height="90"></canvas><div class="note">Processed take (green): +1.5 st and time-warped</div>
+<button id="playRef">▶ Reference</button><button id="playProc">▶ Processed</button><button id="stop">■ Stop</button>
+<div class="grid" style="margin-top:8px">
+<div class="m"><span>QC score</span><b id="score"></b></div><div class="m"><span>F0 error</span><b id="f0mae"></b></div>
+<div class="m"><span>F0 correlation</span><b id="f0corr"></b></div><div class="m"><span>Timing offset</span><b id="offset"></b></div>
+<div class="m"><span>Mel distortion</span><b id="mcd"></b></div><div class="m"><span>Boundary error</span><b id="boundary"></b></div>
+<div class="m"><span>Voiced frames</span><b id="voiced"></b></div><div class="m"><span>Tracker vs truth</span><b id="tracker"></b></div></div>
+<h2 style="margin-top:12px">Score weights</h2>
+<label>F0 <span id="wv_f0">0.40</span></label><input type="range" id="w_f0" min="0" max="1" step="0.05" value="0.4">
+<label>Timing <span id="wv_time">0.30</span></label><input type="range" id="w_time" min="0" max="1" step="0.05" value="0.3">
+<label>Mel distortion <span id="wv_mcd">0.15</span></label><input type="range" id="w_mcd" min="0" max="1" step="0.05" value="0.15">
+<label>Boundary <span id="wv_boundary">0.15</span></label><input type="range" id="w_boundary" min="0" max="1" step="0.05" value="0.15">
+<h2 style="margin-top:12px">Flags</h2><ul id="flags"></ul></section>
+<section><h2>Formant-locked pitch shift</h2>
+<label>Pitch (semitones) <span id="stv">3</span></label><input type="range" id="st" min="-7" max="7" step="1" value="3">
+<label>Formant move (semitones) <span id="fsv">0</span></label><input type="range" id="fs" min="-5" max="5" step="1" value="0">
+<button id="shiftLock">▶ Formant-locked</button><button id="shiftNaive">▶ Naive</button><button id="shiftDl">⬇ WAV</button>
+<div class="note" id="shiftInfo">Plays the reference shifted; compare locked vs naive.</div></section>
+<section><h2>Phoneme mapper</h2>
+<div class="grid"><div><label>From</label><select id="srcInv"></select></div><div><label>To</label><select id="dstInv"></select></div></div>
+<label style="margin-top:8px">Sequence</label><input type="text" id="phIn" value="HH AH L OW W ER L D">
+<table id="phTable" style="margin-top:8px"><tbody id="phOut"></tbody></table></section>
+<section><h2>Not in this build</h2><div class="note">The original bench's other tools (bridge, nudge, warp-path editor, stack, vox, stream) and its sign-in/multiplayer shell are not ported here. The DSP behind them is in the same engine.</div></section>
+<script>
+
+// ---- signal.ts ----
+/** Shared numeric helpers: interpolation, FFT, resampling, WAV/MIDI/PDF packing. */
+
+function interp(samples              , x        )         {
+  const n = samples.length;
+  if (n === 0) return 0;
+  if (x <= 0) return samples[0];
+  if (x >= n - 1) return samples[n - 1];
+  const i = Math.floor(x);
+  const f = x - i;
+  const y0 = samples[i - 1] ?? samples[i];
+  const y1 = samples[i];
+  const y2 = samples[i + 1];
+  const y3 = samples[i + 2] ?? y2;
+  const a = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+  const b = y0 - 2.5 * y1 + 2 * y2 - 0.5 * y3;
+  const c = -0.5 * y0 + 0.5 * y2;
+  return ((a * f + b) * f + c) * f + y1;
+}
+
+function resampleLinear(input              , fromSr        , toSr        )               {
+  if (fromSr === toSr) return input.slice();
+  const outLen = Math.max(1, Math.round((input.length * toSr) / fromSr));
+  const out = new Float32Array(outLen);
+  const step = fromSr / toSr;
+  for (let i = 0; i < outLen; i++) {
+    const x = i * step;
+    const i0 = Math.floor(x);
+    const frac = x - i0;
+    const a = input[Math.min(input.length - 1, Math.max(0, i0))];
+    const b = input[Math.min(input.length - 1, i0 + 1)] ?? a;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
+function lowpassCascade(samples              , sampleRate        , cutoff        , poles = 3)               {
+  let src = samples;
+  const dt = 1 / sampleRate;
+  const alpha = dt / (1 / (2 * Math.PI * cutoff) + dt);
+  for (let pole = 0; pole < poles; pole++) {
+    const y = new Float32Array(src.length);
+    let prev = 0;
+    for (let i = 0; i < src.length; i++) {
+      prev += alpha * (src[i] - prev);
+      y[i] = prev;
+    }
+    src = y;
+  }
+  return src;
+}
+
+function peakNormalize(samples              , peak = 0.89)               {
+  let max = 1e-8;
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i];
+    if (Number.isFinite(s)) max = Math.max(max, Math.abs(s));
+  }
+  const gain = peak / max;
+  const out = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) out[i] = Number.isFinite(samples[i]) ? samples[i] * gain : 0;
+  return out;
+}
+
+function rmsRange(samples              , start        , len        )         {
+  let sum = 0;
+  const end = Math.min(samples.length, start + len);
+  const n = Math.max(1, end - Math.max(0, start));
+  for (let i = Math.max(0, start); i < end; i++) sum += samples[i] * samples[i];
+  return Math.sqrt(sum / n);
+}
+
+function mulberry32(seed        )               {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Radix-2 complex FFT. Inverse scales by 1/n. Length must be a power of two. */
+function fft(re              , im              , inverse = false)       {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const tr = re[i];
+      re[i] = re[j];
+      re[j] = tr;
+      const ti = im[i];
+      im[i] = im[j];
+      im[j] = ti;
+    }
+  }
+  const sign = inverse ? 1 : -1;
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (sign * 2 * Math.PI) / len;
+    const wlenRe = Math.cos(ang);
+    const wlenIm = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let wRe = 1;
+      let wIm = 0;
+      const half = len >> 1;
+      for (let k = 0; k < half; k++) {
+        const aRe = re[i + k];
+        const aIm = im[i + k];
+        const bRe = re[i + k + half] * wRe - im[i + k + half] * wIm;
+        const bIm = re[i + k + half] * wIm + im[i + k + half] * wRe;
+        re[i + k] = aRe + bRe;
+        im[i + k] = aIm + bIm;
+        re[i + k + half] = aRe - bRe;
+        im[i + k + half] = aIm - bIm;
+        const nextRe = wRe * wlenRe - wIm * wlenIm;
+        wIm = wRe * wlenIm + wIm * wlenRe;
+        wRe = nextRe;
+      }
+    }
+  }
+  if (inverse) {
+    for (let i = 0; i < n; i++) {
+      re[i] /= n;
+      im[i] /= n;
+    }
+  }
+}
+
+function shiftSamples(samples              , sampleRate        , ms        )               {
+  const out = new Float32Array(samples.length);
+  const shift = Math.round((ms / 1000) * sampleRate);
+  for (let i = 0; i < samples.length; i++) {
+    const j = i - shift;
+    if (j >= 0 && j < samples.length) out[i] = samples[j];
+  }
+  return out;
+}
+
+function encodeWav(samples              , sampleRate        )       {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const write = (offset        , text        ) => {
+    for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+  };
+  write(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  write(8, "WAVE");
+  write(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  write(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, Number.isFinite(samples[i]) ? samples[i] : 0));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    offset += 2;
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+function simplePdf(title        , lines          )             {
+  const escape = (s        ) => s.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+  const body = [`BT /F1 16 Tf 48 780 Td (${escape(title)}) Tj`, `/F1 10 Tf`];
+  for (const line of lines.slice(0, 42)) body.push(`0 -16 Td (${escape(line).slice(0, 110)}) Tj`);
+  body.push("ET");
+  const stream = body.join("\n");
+  const objects = [
+    `1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n`,
+    `2 0 obj << /Type /Pages /Count 1 /Kids [3 0 R] >> endobj\n`,
+    `3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n`,
+    `4 0 obj << /Length ${stream.length} >> stream\n${stream}\nendstream endobj\n`,
+    `5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n`,
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const obj of objects) {
+    offsets.push(pdf.length);
+    pdf += obj;
+  }
+  const xref = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i < offsets.length; i++) pdf += `${String(offsets[i]).padStart(10, "0")} 00000 n \n`;
+  pdf += `trailer << /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+  return new TextEncoder().encode(pdf);
+}
+
+
+// ---- analyze.ts ----
+/** YIN, mel features, Sakoe-Chiba DTW, and alignment metrics. */
+
+
+const HOP_SEC = 0.01;
+
+                          
+               
+             
+                     
+                 
+ 
+
+                            
+            
+            
+ 
+
+                           
+              
+              
+ 
+
+function f0At(frames           , time        )         {
+  if (frames.length === 0) return 0;
+  let lo = 0;
+  let hi = frames.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].time < time) lo = mid + 1;
+    else hi = mid;
+  }
+  const b = frames[lo];
+  const a = frames[Math.max(0, lo - 1)];
+  return Math.abs(a.time - time) <= Math.abs(b.time - time) ? a.f0 : b.f0;
+}
+
+function trackF0(
+  samples              ,
+  sampleRate        ,
+  opts                                                                        ,
+)            {
+  const fmin = opts?.fmin ?? 70;
+  const fmax = opts?.fmax ?? 780;
+  const threshold = opts?.threshold ?? 0.12;
+  const hopSec = opts?.hopSec ?? HOP_SEC;
+  const analysisSr = 8000;
+  const filtered = lowpassCascade(samples, sampleRate, 3400, 3);
+  const down = resampleLinear(filtered, sampleRate, analysisSr);
+  const maxTau = Math.min(Math.round(analysisSr / fmin), Math.floor(down.length / 3));
+  const minTau = Math.max(2, Math.round(analysisSr / fmax));
+  const W = maxTau;
+  const hop = Math.max(1, Math.round(analysisSr * hopSec));
+  const frames            = [];
+  if (maxTau < 8 || down.length < W + maxTau + 4) return frames;
+
+  for (let start = 0; start + W + maxTau < down.length; start += hop) {
+    const diff = new Float64Array(maxTau + 1);
+    for (let tau = 1; tau <= maxTau; tau++) {
+      let sum = 0;
+      for (let j = 0; j < W; j += 2) {
+        const delta = down[start + j] - down[start + j + tau];
+        sum += delta * delta;
+      }
+      diff[tau] = sum;
+    }
+    const cmnd = new Float64Array(maxTau + 1);
+    cmnd[0] = 1;
+    let running = 0;
+    for (let tau = 1; tau <= maxTau; tau++) {
+      running += diff[tau];
+      cmnd[tau] = (diff[tau] * tau) / (running || 1e-12);
+    }
+    let bestTau = -1;
+    for (let tau = minTau; tau <= maxTau; tau++) {
+      if (cmnd[tau] < threshold) {
+        while (tau + 1 <= maxTau && cmnd[tau + 1] < cmnd[tau]) tau++;
+        bestTau = tau;
+        break;
+      }
+    }
+    const eHop = Math.max(1, Math.round(sampleRate * hopSec));
+    const eStart = Math.min(samples.length - 1, Math.round((start / analysisSr) * sampleRate));
+    const energy = rmsRange(samples, eStart, eHop * 2);
+    let f0 = 0;
+    let confidence = 0;
+    if (bestTau > 1) {
+      const y0 = cmnd[bestTau - 1];
+      const y1 = cmnd[bestTau];
+      const y2 = cmnd[Math.min(maxTau, bestTau + 1)];
+      const denom = y0 + y2 - 2 * y1;
+      const shift = Math.abs(denom) > 1e-12 ? (y0 - y2) / (2 * denom) : 0;
+      const tau = bestTau + Math.max(-0.5, Math.min(0.5, shift));
+      f0 = analysisSr / tau;
+      confidence = Math.max(0, Math.min(1, 1 - y1));
+    }
+    frames.push({ time: (start + W * 0.5) / analysisSr, f0, confidence, energy });
+  }
+
+  // Gate against a robust level (95th percentile), not the single loudest frame: one noise burst
+  // must not push every quiet vowel under the gate.
+  const sorted = frames.map((frame) => frame.energy).sort((a, b) => a - b);
+  const peakE = Math.max(1e-8, sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))] ?? 0);
+  for (const frame of frames) {
+    if (frame.energy < peakE * 0.07) {
+      frame.f0 = 0;
+      frame.confidence = 0;
+    }
+  }
+  return medianSmoothF0(frames, 5);
+}
+
+function medianSmoothF0(frames           , win        )            {
+  const out = frames.map((frame) => ({ ...frame }));
+  const half = Math.floor(win / 2);
+  for (let i = 0; i < out.length; i++) {
+    if (out[i].f0 <= 0) continue;
+    const vals           = [];
+    for (let k = i - half; k <= i + half; k++) {
+      if (k >= 0 && k < frames.length && frames[k].f0 > 0) vals.push(frames[k].f0);
+    }
+    if (vals.length < 3) continue;
+    vals.sort((a, b) => a - b);
+    const med = vals[vals.length >> 1];
+    const cents = 1200 * Math.log2(out[i].f0 / med);
+    if (Math.abs(cents) > 650) {
+      out[i].f0 = med;
+      out[i].confidence *= 0.6;
+    }
+  }
+  return out;
+}
+
+function hzToMel(hz        )         {
+  return 2595 * Math.log10(1 + hz / 700);
+}
+function melToHz(mel        )         {
+  return 700 * (10 ** (mel / 2595) - 1);
+}
+
+const melCache = new Map                        ();
+
+function melFilters(sampleRate        , nfft        , nMels        )                 {
+  const key = `${sampleRate}:${nfft}:${nMels}`;
+  const cached = melCache.get(key);
+  if (cached) return cached;
+  const mMin = hzToMel(70);
+  const mMax = hzToMel(Math.min(7600, sampleRate / 2 - 80));
+  const edges = new Float64Array(nMels + 2);
+  for (let i = 0; i < edges.length; i++) {
+    const hz = melToHz(mMin + ((mMax - mMin) * i) / (edges.length - 1));
+    edges[i] = Math.floor(((nfft + 1) * hz) / sampleRate);
+  }
+  const filters                 = [];
+  for (let m = 1; m <= nMels; m++) {
+    const filt = new Float64Array(nfft / 2);
+    const left = edges[m - 1];
+    const center = edges[m];
+    const right = edges[m + 1];
+    for (let k = left; k < center; k++) {
+      if (k >= 0 && k < filt.length && center !== left) filt[k] = (k - left) / (center - left);
+    }
+    for (let k = center; k < right; k++) {
+      if (k >= 0 && k < filt.length && right !== center) filt[k] = (right - k) / (right - center);
+    }
+    filters.push(filt);
+  }
+  melCache.set(key, filters);
+  return filters;
+}
+
+                           
+               
+                      
+                 
+ 
+
+function melFrames(samples              , sampleRate        , nMels = 12, hopSec = HOP_SEC)             {
+  const nfft = 512;
+  const hop = Math.max(1, Math.round(sampleRate * hopSec));
+  const filters = melFilters(sampleRate, nfft, nMels);
+  const out             = [];
+  const re = new Float64Array(nfft);
+  const im = new Float64Array(nfft);
+  for (let start = 0; start + nfft <= samples.length; start += hop) {
+    re.fill(0);
+    im.fill(0);
+    let energy = 0;
+    for (let i = 0; i < nfft; i++) {
+      const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (nfft - 1));
+      const s = samples[start + i];
+      energy += s * s;
+      re[i] = s * w;
+    }
+    fft(re, im, false);
+    const mags = new Float64Array(nfft / 2);
+    for (let k = 0; k < mags.length; k++) mags[k] = Math.hypot(re[k], im[k]);
+    const bands = new Float64Array(nMels);
+    let mean = 0;
+    for (let b = 0; b < nMels; b++) {
+      let acc = 0;
+      const filt = filters[b];
+      for (let k = 0; k < mags.length; k++) acc += mags[k] * filt[k];
+      bands[b] = Math.log(acc + 1e-8);
+      mean += bands[b];
+    }
+    mean /= nMels;
+    for (let b = 0; b < nMels; b++) bands[b] -= mean;
+    out.push({ time: (start + nfft / 2) / sampleRate, bands, energy: Math.sqrt(energy / nfft) });
+  }
+  return out;
+}
+
+function featuresOf(samples              , sampleRate        )                 {
+  return melFrames(samples, sampleRate, 12, HOP_SEC).map((frame) => {
+    const feat = new Float64Array(13);
+    feat.set(frame.bands);
+    feat[12] = Math.log(frame.energy + 1e-8);
+    return feat;
+  });
+}
+
+function vecDist(a              , b              )         {
+  let s = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const d = a[i] - b[i];
+    s += d * d;
+  }
+  return Math.sqrt(s);
+}
+
+function dtw(a                , b                , radius = 40)                                          {
+  const n = a.length;
+  const m = b.length;
+  if (!n || !m) return { path: [], meanCost: 0 };
+  const INF = 1e15;
+  const cost = new Float64Array(n * m);
+  cost.fill(INF);
+  const pred = new Uint8Array(n * m);
+  const at = (i        , j        ) => i * m + j;
+  for (let i = 0; i < n; i++) {
+    const center = Math.round((i * (m - 1)) / Math.max(1, n - 1));
+    let j0 = Math.max(0, center - radius);
+    let j1 = Math.min(m - 1, center + radius);
+    if (i === 0) j0 = 0;
+    if (i === n - 1) j1 = m - 1;
+    for (let j = j0; j <= j1; j++) {
+      const local = vecDist(a[i], b[j]);
+      if (i === 0 && j === 0) {
+        cost[0] = local;
+        continue;
+      }
+      let best = INF;
+      let how = 0;
+      if (i > 0 && j > 0 && cost[at(i - 1, j - 1)] < best) {
+        best = cost[at(i - 1, j - 1)];
+        how = 0;
+      }
+      if (i > 1 && j > 0 && cost[at(i - 2, j - 1)] < best) {
+        best = cost[at(i - 2, j - 1)];
+        how = 1;
+      }
+      if (i > 0 && j > 1 && cost[at(i - 1, j - 2)] < best) {
+        best = cost[at(i - 1, j - 2)];
+        how = 2;
+      }
+      if (i > 0 && cost[at(i - 1, j)] < best) {
+        best = cost[at(i - 1, j)];
+        how = 3;
+      }
+      if (j > 0 && cost[at(i, j - 1)] < best) {
+        best = cost[at(i, j - 1)];
+        how = 4;
+      }
+      if (best >= INF / 2) continue;
+      cost[at(i, j)] = best + local * (how === 1 || how === 2 ? 1.12 : 1);
+      pred[at(i, j)] = how;
+    }
+  }
+  let i = n - 1;
+  let j = m - 1;
+  if (cost[at(i, j)] >= INF / 2) {
+    let best = INF;
+    for (let jj = 0; jj < m; jj++) {
+      if (cost[at(i, jj)] < best) {
+        best = cost[at(i, jj)];
+        j = jj;
+      }
+    }
+  }
+  const path              = [];
+  let guard = 0;
+  while ((i > 0 || j > 0) && guard++ < n + m + 8) {
+    path.push({ i, j });
+    const how = pred[at(i, j)];
+    if (how === 0 && i > 0 && j > 0) {
+      i--;
+      j--;
+    } else if (how === 1 && i > 1 && j > 0) {
+      i -= 2;
+      j--;
+    } else if (how === 2 && i > 0 && j > 1) {
+      i--;
+      j -= 2;
+    } else if (how === 3 && i > 0) i--;
+    else if (how === 4 && j > 0) j--;
+    else if (i > 0 && j > 0) {
+      i--;
+      j--;
+    } else if (i > 0) i--;
+    else j--;
+  }
+  path.push({ i: 0, j: 0 });
+  path.reverse();
+  const end = path[path.length - 1];
+  const total = cost[at(end.i, end.j)];
+  return { path, meanCost: Number.isFinite(total) ? total / path.length : 0 };
+}
+
+function dtwCausal(
+  a                ,
+  b                ,
+  radius        ,
+  lookahead        ,
+)                                                {
+  const n = a.length;
+  const m = b.length;
+  const INF = 1e15;
+  const cost = new Float64Array(n * m);
+  cost.fill(INF);
+  const pred = new Uint8Array(n * m);
+  const at = (i        , j        ) => i * m + j;
+  const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
+  for (let i = 0; i < n; i++) {
+    const center = Math.round((i * (m - 1)) / Math.max(1, n - 1));
+    const j0 = i === 0 ? 0 : Math.max(0, center - radius);
+    const j1 = Math.min(m - 1, center + radius, i + Math.max(0, lookahead));
+    for (let j = j0; j <= j1; j++) {
+      const local = vecDist(a[i], b[j]);
+      if (i === 0 && j === 0) {
+        cost[0] = local;
+        continue;
+      }
+      let best = INF;
+      let how = 0;
+      if (i > 0 && j > 0 && cost[at(i - 1, j - 1)] < best) {
+        best = cost[at(i - 1, j - 1)];
+        how = 0;
+      }
+      if (i > 1 && j > 0 && cost[at(i - 2, j - 1)] < best) {
+        best = cost[at(i - 2, j - 1)];
+        how = 1;
+      }
+      if (i > 0 && j > 1 && cost[at(i - 1, j - 2)] < best) {
+        best = cost[at(i - 1, j - 2)];
+        how = 2;
+      }
+      if (best >= INF / 2) continue;
+      cost[at(i, j)] = best + local;
+      pred[at(i, j)] = how;
+    }
+  }
+  const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
+  let i = n - 1;
+  let j = 0;
+  let best = INF;
+  for (let jj = 0; jj < m; jj++) {
+    if (cost[at(i, jj)] < best) {
+      best = cost[at(i, jj)];
+      j = jj;
+    }
+  }
+  const path              = [];
+  let guard = 0;
+  while ((i > 0 || j > 0) && guard++ < n + m + 8) {
+    path.push({ i, j });
+    const how = pred[at(i, j)];
+    if (how === 0 && i > 0 && j > 0) {
+      i--;
+      j--;
+    } else if (how === 1 && i > 1) {
+      i -= 2;
+      j = Math.max(0, j - 1);
+    } else if (how === 2 && j > 1) {
+      i = Math.max(0, i - 1);
+      j -= 2;
+    } else if (i > 0) i--;
+    else if (j > 0) j--;
+    else break;
+  }
+  path.push({ i: 0, j: 0 });
+  path.reverse();
+  return { path, microsPerFrame: (elapsed * 1000) / Math.max(1, n) };
+}
+
+function pathErrorMs(causal             , offline             , hopSec = HOP_SEC)         {
+  const offlineAt = new Map                ();
+  for (const point of offline) offlineAt.set(point.i, point.j);
+  let acc = 0;
+  let n = 0;
+  let lastJ = 0;
+  for (const point of causal) {
+    const oj = offlineAt.get(point.i);
+    if (oj !== undefined) lastJ = oj;
+    acc += Math.abs(point.j - (oj ?? lastJ)) * hopSec * 1000;
+    n++;
+  }
+  return n ? acc / n : 0;
+}
+
+function rdp(points            , epsilon        )             {
+  if (points.length < 3) return points.slice();
+  const a = points[0];
+  const b = points[points.length - 1];
+  const dx = b.ref - a.ref || 1e-6;
+  const dy = b.src - a.src;
+  let maxD = 0;
+  let index = 0;
+  for (let i = 1; i < points.length - 1; i++) {
+    const proj = a.src + dy * ((points[i].ref - a.ref) / dx);
+    const d = Math.abs(points[i].src - proj);
+    if (d > maxD) {
+      maxD = d;
+      index = i;
+    }
+  }
+  if (maxD <= epsilon) return [a, b];
+  const left = rdp(points.slice(0, index + 1), epsilon);
+  const right = rdp(points.slice(index), epsilon);
+  return left.slice(0, -1).concat(right);
+}
+
+function nodesFromPath(path             , hopSec = HOP_SEC, epsilon = 0.025)             {
+  if (!path.length) return [];
+  const dense             = [];
+  const step = Math.max(1, Math.floor(path.length / 240));
+  for (let k = 0; k < path.length; k += step) dense.push({ ref: path[k].j * hopSec, src: path[k].i * hopSec });
+  const last = path[path.length - 1];
+  dense.push({ ref: last.j * hopSec, src: last.i * hopSec });
+  const simplified = rdp(dense, epsilon);
+  for (let i = 1; i < simplified.length; i++) {
+    if (simplified[i].ref < simplified[i - 1].ref) simplified[i].ref = simplified[i - 1].ref;
+    if (simplified[i].src < simplified[i - 1].src) simplified[i].src = simplified[i - 1].src;
+  }
+  return simplified;
+}
+
+function mapFromNodes(nodes            )                           {
+  if (!nodes.length) return (t) => t;
+  return (refT        ) => {
+    if (refT <= nodes[0].ref) return nodes[0].src + (refT - nodes[0].ref);
+    const last = nodes[nodes.length - 1];
+    if (refT >= last.ref) {
+      const prev = nodes[Math.max(0, nodes.length - 2)];
+      const slope = (last.src - prev.src) / Math.max(1e-4, last.ref - prev.ref);
+      return last.src + (refT - last.ref) * slope;
+    }
+    let lo = 0;
+    let hi = nodes.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (nodes[mid].ref <= refT) lo = mid;
+      else hi = mid;
+    }
+    const a = nodes[lo];
+    const b = nodes[hi];
+    const u = (refT - a.ref) / Math.max(1e-6, b.ref - a.ref);
+    return a.src + (b.src - a.src) * u;
+  };
+}
+
+function spectralFluxTimes(samples              , sampleRate        )           {
+  const frames = melFrames(samples, sampleRate, 12, HOP_SEC);
+  const flux           = [];
+  for (let i = 1; i < frames.length; i++) {
+    let s = 0;
+    for (let k = 0; k < frames[i].bands.length; k++) {
+      const d = frames[i].bands[k] - frames[i - 1].bands[k];
+      if (d > 0) s += d;
+    }
+    flux.push(s);
+  }
+  let mean = 0;
+  for (const v of flux) mean += v;
+  mean /= Math.max(1, flux.length);
+  let variance = 0;
+  for (const v of flux) variance += (v - mean) ** 2;
+  const std = Math.sqrt(variance / Math.max(1, flux.length));
+  const times           = [];
+  for (let i = 1; i < flux.length - 1; i++) {
+    if (flux[i] > mean + std * 1.4 && flux[i] >= flux[i - 1] && flux[i] >= flux[i + 1]) times.push(frames[i + 1].time);
+  }
+  return times;
+}
+
+function protectTransients(nodes            , peakSrcTimes          )             {
+  if (nodes.length < 2 || !peakSrcTimes.length) return nodes.map((node) => ({ ...node }));
+  const out = nodes.map((node) => ({ ...node }));
+  for (const peak of peakSrcTimes) {
+    let nearest = 0;
+    let best = Infinity;
+    for (let i = 0; i < out.length; i++) {
+      const d = Math.abs(out[i].src - peak);
+      if (d < best) {
+        best = d;
+        nearest = i;
+      }
+    }
+    if (best > 0.08 || nearest === 0 || nearest === out.length - 1) continue;
+    const prev = out[nearest - 1];
+    const node = out[nearest];
+    node.src = node.src * 0.45 + (prev.src + (node.ref - prev.ref)) * 0.55;
+  }
+  for (let i = 1; i < out.length; i++) {
+    if (out[i].src < out[i - 1].src) out[i].src = out[i - 1].src + 0.001;
+    if (out[i].ref < out[i - 1].ref) out[i].ref = out[i - 1].ref + 0.001;
+  }
+  return out;
+}
+
+function cepstralEnvDb(frame              , nfft        , lifter = 24)               {
+  const re = new Float64Array(nfft);
+  const im = new Float64Array(nfft);
+  for (let i = 0; i < frame.length && i < nfft; i++) {
+    const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / Math.max(1, Math.min(frame.length, nfft) - 1));
+    re[i] = frame[i] * w;
+  }
+  fft(re, im, false);
+  const logMag = new Float64Array(nfft);
+  for (let k = 0; k <= nfft / 2; k++) {
+    const v = Math.log(Math.hypot(re[k], im[k]) + 1e-10);
+    logMag[k] = v;
+    if (k > 0 && k < nfft / 2) logMag[nfft - k] = v;
+  }
+  const cre = logMag;
+  const cim = new Float64Array(nfft);
+  fft(cre, cim, true);
+  for (let i = lifter; i <= nfft - lifter; i++) {
+    cre[i] = 0;
+    cim[i] = 0;
+  }
+  fft(cre, cim, false);
+  const env = new Float64Array(nfft / 2);
+  for (let k = 0; k < env.length; k++) env[k] = (20 / Math.LN10) * cre[k];
+  return env;
+}
+
+function envelopeErrorDb(a              , b              , sampleRate        )         {
+  const nfft = 1024;
+  const hop = 256;
+  const frames = Math.min(Math.floor((a.length - nfft) / hop), Math.floor((b.length - nfft) / hop));
+  const k0 = Math.max(1, Math.floor((250 * nfft) / sampleRate));
+  const k1 = Math.min(nfft / 2 - 1, Math.floor((4200 * nfft) / sampleRate));
+  let acc = 0;
+  let n = 0;
+  for (let i = 0; i < frames; i += 2) {
+    const start = i * hop;
+    if (rmsRange(a, start, nfft) < 0.02 || rmsRange(b, start, nfft) < 0.02) continue;
+    const ea = cepstralEnvDb(a.subarray(start, start + nfft), nfft);
+    const eb = cepstralEnvDb(b.subarray(start, start + nfft), nfft);
+    let ma = 0;
+    let mb = 0;
+    const count = k1 - k0 + 1;
+    for (let k = k0; k <= k1; k++) {
+      ma += ea[k];
+      mb += eb[k];
+    }
+    ma /= count;
+    mb /= count;
+    for (let k = k0; k <= k1; k++) {
+      acc += Math.abs(ea[k] - ma - (eb[k] - mb));
+      n++;
+    }
+  }
+  return n ? acc / n : 0;
+}
+
+function envelopeCurves(samples              , sampleRate        )                               {
+  const nfft = 1024;
+  const start = Math.max(0, Math.floor(samples.length / 2 - nfft / 2));
+  const frame = new Float32Array(nfft);
+  frame.set(samples.subarray(start, Math.min(samples.length, start + nfft)));
+  const env = cepstralEnvDb(frame, nfft);
+  const pts                               = [];
+  for (let k = 2; k < env.length; k += 2) pts.push({ hz: (k * sampleRate) / nfft, db: env[k] });
+  return pts;
+}
+
+function dctOrtho(bands              )               {
+  const n = bands.length;
+  const c = new Float64Array(n);
+  const scale = Math.sqrt(2 / n);
+  for (let k = 0; k < n; k++) {
+    let s = 0;
+    for (let i = 0; i < n; i++) s += bands[i] * Math.cos((Math.PI * k * (i + 0.5)) / n);
+    c[k] = scale * s * (k === 0 ? 1 / Math.SQRT2 : 1);
+  }
+  return c;
+}
+
+function melCepstralDistortion(a              , b              , sampleRate        )         {
+  const fa = melFrames(a, sampleRate, 20, 0.012);
+  const fb = melFrames(b, sampleRate, 20, 0.012);
+  const n = Math.min(fa.length, fb.length);
+  let acc = 0;
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    if (fa[i].energy < 0.015 || fb[i].energy < 0.015) continue;
+    const ca = dctOrtho(fa[i].bands);
+    const cb = dctOrtho(fb[i].bands);
+    let s = 0;
+    for (let k = 1; k <= 12 && k < ca.length; k++) {
+      const d = ca[k] - cb[k];
+      s += d * d;
+    }
+    acc += (10 / Math.LN10) * Math.sqrt(2 * s);
+    count++;
+  }
+  return count ? acc / count : 0;
+}
+
+function envelope(samples              , sampleRate        )               {
+  const hop = Math.max(1, Math.round(sampleRate * HOP_SEC));
+  const win = hop * 2;
+  const frames = Math.max(0, Math.floor((samples.length - win) / hop));
+  const env = new Float64Array(frames);
+  for (let i = 0; i < frames; i++) env[i] = rmsRange(samples, i * hop, win);
+  return env;
+}
+
+function timingOffsetMs(reference              , processed              , sampleRate        )         {
+  const a = envelope(reference, sampleRate);
+  const b = envelope(processed, sampleRate);
+  const maxLag = Math.min(40, Math.floor(a.length / 3));
+  let best = -Infinity;
+  let bestLag = 0;
+  for (let lag = -maxLag; lag <= maxLag; lag++) {
+    let s = 0;
+    let n = 0;
+    for (let i = 0; i < a.length; i++) {
+      const j = i + lag;
+      if (j < 0 || j >= b.length) continue;
+      s += a[i] * b[j];
+      n++;
+    }
+    if (n > 8 && s > best) {
+      best = s;
+      bestLag = lag;
+    }
+  }
+  return bestLag * HOP_SEC * 1000;
+}
+
+                            
+             
+               
+              
+                   
+ 
+
+                           
+                     
+                 
+                       
+                   
+              
+                     
+                
+                                         
+                                                      
+ 
+
+function pearson(xs          , ys          )         {
+  const n = Math.min(xs.length, ys.length);
+  if (n < 3) return 0;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < n; i++) {
+    mx += xs[i];
+    my += ys[i];
+  }
+  mx /= n;
+  my /= n;
+  let num = 0;
+  let dx = 0;
+  let dy = 0;
+  for (let i = 0; i < n; i++) {
+    const a = xs[i] - mx;
+    const b = ys[i] - my;
+    num += a * b;
+    dx += a * a;
+    dy += b * b;
+  }
+  return dx > 0 && dy > 0 ? num / Math.sqrt(dx * dy) : 0;
+}
+
+function analyzeAlignment(opts   
+                          
+                          
+                     
+                    
+                     
+                       
+                        
+                     
+ )           {
+  const refF0 = opts.refF0 ?? trackF0(opts.reference, opts.sampleRate);
+  const procF0 = opts.procF0 ?? trackF0(opts.processed, opts.sampleRate);
+  const xs           = [];
+  const ys           = [];
+  const series                                 = [];
+  for (const frame of refF0) {
+    if (frame.f0 <= 0) continue;
+    let nearest = procF0[0];
+    let best = Infinity;
+    for (const other of procF0) {
+      const d = Math.abs(other.time - frame.time);
+      if (d < best) {
+        best = d;
+        nearest = other;
+      }
+    }
+    if (!nearest || nearest.f0 <= 0 || best > 0.02) continue;
+    xs.push(frame.f0);
+    ys.push(nearest.f0);
+    series.push({ t: frame.time, cents: 1200 * Math.log2(nearest.f0 / frame.f0) });
+  }
+  const f0MaeCents = series.length ? series.reduce((s, p) => s + Math.abs(p.cents), 0) / series.length : 0;
+  const offsetMs = timingOffsetMs(opts.reference, opts.processed, opts.sampleRate);
+  const mcd = melCepstralDistortion(opts.reference, shiftSamples(opts.processed, opts.sampleRate, offsetMs), opts.sampleRate);
+  const pairs = Math.min(opts.refOnsets?.length ?? 0, opts.procOnsets?.length ?? 0);
+  let boundaryMs = 0;
+  if (pairs && opts.refOnsets && opts.procOnsets) {
+    let s = 0;
+    for (let i = 0; i < pairs; i++) s += Math.abs(opts.procOnsets[i] - opts.refOnsets[i]) * 1000;
+    boundaryMs = s / pairs;
+  }
+  const w = opts.weights;
+  const wsum = Math.max(1e-6, w.f0 + w.time + w.mcd + w.boundary);
+  const score =
+    (100 *
+      (w.f0 * Math.exp(-f0MaeCents / 80) +
+        w.time * Math.exp(-Math.abs(offsetMs) / 40) +
+        w.mcd * Math.exp(-mcd / 5) +
+        w.boundary * Math.exp(-boundaryMs / 35))) /
+    wsum;
+  const flags                    = [];
+  let run = -1;
+  for (let i = 0; i < series.length; i++) {
+    const bad = Math.abs(series[i].cents) > 80;
+    if (bad && run < 0) run = i;
+    if ((!bad || i === series.length - 1) && run >= 0) {
+      const end = bad && i === series.length - 1 ? i : i - 1;
+      if (series[end].t - series[run].t > 0.06) {
+        flags.push({ t0: series[run].t, t1: series[end].t, reason: "F0 off by more than 80 cents" });
+      }
+      run = -1;
+    }
+  }
+  return { f0MaeCents, f0Corr: pearson(xs, ys), voicedFrames: series.length, offsetMs, mcd, boundaryMs, score, series, flags };
+}
+
+function spectralFlatnessFrame(samples              , start        , nfft        )         {
+  if (start < 0 || start + nfft > samples.length) return 0;
+  const re = new Float64Array(nfft);
+  const im = new Float64Array(nfft);
+  for (let i = 0; i < nfft; i++) {
+    const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (nfft - 1));
+    re[i] = samples[start + i] * w;
+  }
+  fft(re, im, false);
+  let logSum = 0;
+  let arith = 0;
+  const bins = nfft / 2 - 1;
+  for (let k = 1; k <= bins; k++) {
+    const mag = Math.hypot(re[k], im[k]) + 1e-12;
+    logSum += Math.log(mag);
+    arith += mag;
+  }
+  return Math.exp(logSum / bins) / (arith / bins);
+}
+
+
+// ---- phonemes.ts ----
+/** Versioned phoneme inventories with articulatory features and provenance. */
+
+                                                                                       
+                   
+           
+            
+            
+         
+             
+         
+           
+             
+            
+          
+                                                                                                  
+                                                    
+
+                                                                                                        
+
+                          
+             
+                
+                 
+               
+                 
+                 
+               
+                 
+                                                                                   
+                     
+                   
+                                                  
+ 
+
+const CITE_EN = "English inventory aligned to ARPAbet / X-SAMPA (Wells 1995; Ladefoged & Johnson).";
+const CITE_DUR = "Duration advice uses typical isolated-phoneme ranges (Klatt 1979; Crystal & House 1988), not a copied table.";
+const CITE_JA = "Japanese mora set follows the SynthV/VOCALOID 5-vowel inventory (a i u e o, moraic N, geminate).";
+
+function p(
+  id        ,
+  voiced       ,
+  manner        ,
+  place       ,
+  durationMs        ,
+  spellings                                      ,
+  extra                                                                               ,
+)          {
+  return {
+    id,
+    voiced,
+    manner,
+    place,
+    height: extra?.height ?? "mid",
+    back: extra?.back ?? "central",
+    round: extra?.round ?? 0,
+    lateral: extra?.lateral ?? 0,
+    durationMs,
+    citation: `${extra?.citation ?? CITE_EN} ${CITE_DUR}`,
+    spellings,
+  };
+}
+
+const V = (
+  id        ,
+  height        ,
+  back          ,
+  round       ,
+  durationMs        ,
+  spellings                                      ,
+) =>
+  p(id, 1, "vowel", "vow", durationMs, spellings, { height, back, round });
+
+const PHONEMES            = [
+  p("p", 0, "stop", "bilab", 70, { arpabet: "P", ipa: "p", xsampa: "p", "synthv-en": "p", ace: "p", vocaloid: "p" }),
+  p("b", 1, "stop", "bilab", 75, { arpabet: "B", ipa: "b", xsampa: "b", "synthv-en": "b", ace: "b", vocaloid: "b" }),
+  p("t", 0, "stop", "alv", 65, { arpabet: "T", ipa: "t", xsampa: "t", "synthv-en": "t", ace: "t", vocaloid: "t" }),
+  p("d", 1, "stop", "alv", 70, { arpabet: "D", ipa: "d", xsampa: "d", "synthv-en": "d", ace: "d", vocaloid: "d" }),
+  p("k", 0, "stop", "velar", 80, { arpabet: "K", ipa: "k", xsampa: "k", "synthv-en": "k", ace: "k", vocaloid: "k" }),
+  p("g", 1, "stop", "velar", 75, { arpabet: "G", ipa: "ɡ", xsampa: "g", "synthv-en": "g", ace: "g", vocaloid: "g" }),
+  p("qmark", 0, "stop", "glottal", 60, { ipa: "ʔ", xsampa: "?" }, { citation: "Glottal stop is in IPA/X-SAMPA but absent from SynthV EN, ACE, and VOCALOID symbol sets." }),
+  p("f", 0, "fric", "labden", 110, { arpabet: "F", ipa: "f", xsampa: "f", "synthv-en": "f", ace: "f", vocaloid: "f" }),
+  p("v", 1, "fric", "labden", 90, { arpabet: "V", ipa: "v", xsampa: "v", "synthv-en": "v", ace: "v", vocaloid: "v" }),
+  p("th", 0, "fric", "dental", 95, { arpabet: "TH", ipa: "θ", xsampa: "T", "synthv-en": "T", ace: "TH", vocaloid: "T" }),
+  p("dh", 1, "fric", "dental", 80, { arpabet: "DH", ipa: "ð", xsampa: "D", "synthv-en": "D", ace: "DH", vocaloid: "D" }),
+  p("s", 0, "fric", "alv", 120, { arpabet: "S", ipa: "s", xsampa: "s", "synthv-en": "s", ace: "s", vocaloid: "s" }),
+  p("z", 1, "fric", "alv", 100, { arpabet: "Z", ipa: "z", xsampa: "z", "synthv-en": "z", ace: "z", vocaloid: "z" }),
+  p("sh", 0, "fric", "postalv", 120, { arpabet: "SH", ipa: "ʃ", xsampa: "S", "synthv-en": "S", ace: "SH", vocaloid: "S" }),
+  p("zh", 1, "fric", "postalv", 95, { arpabet: "ZH", ipa: "ʒ", xsampa: "Z", "synthv-en": "Z", ace: "ZH", vocaloid: "Z" }),
+  p("hh", 0, "fric", "glottal", 80, { arpabet: "HH", ipa: "h", xsampa: "h", "synthv-en": "h", ace: "HH", vocaloid: "h" }),
+  p("lh", 0, "fric", "alv", 110, { ipa: "ɬ", xsampa: "K\\" }, { lateral: 1, citation: "Voiceless lateral fricative. Not in ARPAbet, SynthV, ACE, or VOCALOID English sets." }),
+  p("ch", 0, "affr", "postalv", 110, { arpabet: "CH", ipa: "tʃ", xsampa: "tS", "synthv-en": "tS", ace: "CH", vocaloid: "tS" }),
+  p("jh", 1, "affr", "postalv", 100, { arpabet: "JH", ipa: "dʒ", xsampa: "dZ", "synthv-en": "dZ", ace: "JH", vocaloid: "dZ" }),
+  p("m", 1, "nasal", "bilab", 80, { arpabet: "M", ipa: "m", xsampa: "m", "synthv-en": "m", ace: "m", vocaloid: "m" }),
+  p("n", 1, "nasal", "alv", 75, { arpabet: "N", ipa: "n", xsampa: "n", "synthv-en": "n", ace: "n", vocaloid: "n" }),
+  p("ng", 1, "nasal", "velar", 90, { arpabet: "NG", ipa: "ŋ", xsampa: "N", "synthv-en": "N", ace: "NG", vocaloid: "N" }),
+  p("l", 1, "approx", "alv", 75, { arpabet: "L", ipa: "l", xsampa: "l", "synthv-en": "l", ace: "l", vocaloid: "l" }),
+  p("r", 1, "approx", "alv", 80, { arpabet: "R", ipa: "ɹ", xsampa: "r\\", "synthv-en": "r\\", ace: "R", vocaloid: "r\\" }),
+  p("w", 1, "glide", "labvel", 70, { arpabet: "W", ipa: "w", xsampa: "w", "synthv-en": "w", ace: "w", vocaloid: "w" }),
+  p("y", 1, "glide", "pal", 65, { arpabet: "Y", ipa: "j", xsampa: "j", "synthv-en": "j", ace: "Y", vocaloid: "j" }),
+  V("iy", "close", "front", 0, 140, { arpabet: "IY", ipa: "i", xsampa: "i", "synthv-en": "i", ace: "IY", vocaloid: "i", "synthv-ja": "i" }),
+  V("ih", "nearclose", "front", 0, 90, { arpabet: "IH", ipa: "ɪ", xsampa: "I", "synthv-en": "I", ace: "IH", vocaloid: "I" }),
+  V("ey", "closemid", "front", 0, 150, { arpabet: "EY", ipa: "eɪ", xsampa: "eI", "synthv-en": "eI", ace: "EY", vocaloid: "eI" }),
+  V("eh", "openmid", "front", 0, 110, { arpabet: "EH", ipa: "ɛ", xsampa: "E", "synthv-en": "E", ace: "EH", vocaloid: "E", "synthv-ja": "e" }),
+  V("ae", "nearopen", "front", 0, 150, { arpabet: "AE", ipa: "æ", xsampa: "{", "synthv-en": "{", ace: "AE", vocaloid: "{" }),
+  V("aa", "open", "back", 0, 160, { arpabet: "AA", ipa: "ɑ", xsampa: "A", "synthv-en": "A", ace: "AA", vocaloid: "A", "synthv-ja": "a" }),
+  V("ao", "openmid", "back", 1, 160, { arpabet: "AO", ipa: "ɔ", xsampa: "O", "synthv-en": "O", ace: "AO", vocaloid: "O" }),
+  V("ow", "closemid", "back", 1, 160, { arpabet: "OW", ipa: "oʊ", xsampa: "oU", "synthv-en": "oU", ace: "OW", vocaloid: "oU", "synthv-ja": "o" }),
+  V("uh", "nearclose", "back", 1, 90, { arpabet: "UH", ipa: "ʊ", xsampa: "U", "synthv-en": "U", ace: "UH", vocaloid: "U" }),
+  V("uw", "close", "back", 1, 140, { arpabet: "UW", ipa: "u", xsampa: "u", "synthv-en": "u", ace: "UW", vocaloid: "u", "synthv-ja": "u" }),
+  V("ah", "openmid", "central", 0, 100, { arpabet: "AH", ipa: "ʌ", xsampa: "V", "synthv-en": "V", ace: "AH", vocaloid: "V" }),
+  V("ax", "mid", "central", 0, 70, { arpabet: "AX", ipa: "ə", xsampa: "@", "synthv-en": "@", ace: "AX", vocaloid: "@" }),
+  V("er", "mid", "central", 0, 140, { arpabet: "ER", ipa: "ɝ", xsampa: "3", "synthv-en": "3", ace: "ER", vocaloid: "3" }),
+  p("N", 1, "nasal", "alv", 120, { "synthv-ja": "N", vocaloid: "N\\" }, { citation: CITE_JA }),
+  p("q", 0, "stop", "glottal", 90, { "synthv-ja": "cl", vocaloid: "cl" }, { citation: `${CITE_JA} Geminate/closure is advisory only.` }),
+];
+
+const INVENTORIES                                                     = [
+  { id: "arpabet", label: "ARPAbet", note: "CMU-style English" },
+  { id: "ipa", label: "IPA", note: "Includes symbols engines lack" },
+  { id: "xsampa", label: "X-SAMPA", note: "ASCII IPA" },
+  { id: "synthv-en", label: "SynthV EN", note: "X-SAMPA-like English set" },
+  { id: "synthv-ja", label: "SynthV JA", note: "5 vowels + moraic N" },
+  { id: "ace", label: "ACE Studio", note: "English ARPAbet-like" },
+  { id: "vocaloid", label: "VOCALOID", note: "X-SAMPA plus JA closures" },
+];
+
+const MANNER_ORDER           = ["stop", "fric", "affr", "nasal", "approx", "glide", "vowel"];
+const PLACE_ORDER          = ["bilab", "labden", "dental", "alv", "postalv", "pal", "velar", "glottal", "labvel", "vow"];
+const HEIGHT_ORDER           = ["close", "nearclose", "closemid", "mid", "openmid", "nearopen", "open"];
+const BACK_ORDER             = ["front", "central", "back"];
+
+function featureDistance(a         , b         )         {
+  let d = a.voiced === b.voiced ? 0 : 1.15;
+  d += Math.abs(MANNER_ORDER.indexOf(a.manner) - MANNER_ORDER.indexOf(b.manner)) * 0.8;
+  d += Math.abs(PLACE_ORDER.indexOf(a.place) - PLACE_ORDER.indexOf(b.place)) * 0.45;
+  if (a.lateral !== b.lateral) d += 1.6;
+  if (a.manner === "vowel" && b.manner === "vowel") {
+    d += Math.abs(HEIGHT_ORDER.indexOf(a.height) - HEIGHT_ORDER.indexOf(b.height)) * 0.4;
+    d += Math.abs(BACK_ORDER.indexOf(a.back) - BACK_ORDER.indexOf(b.back)) * 0.4;
+    if (a.round !== b.round) d += 0.35;
+  } else if (a.manner === "vowel" || b.manner === "vowel") {
+    d += 2.4;
+  }
+  return d;
+}
+
+                          
+                 
+                 
+                    
+                                                             
+                     
+                          
+                   
+                   
+ 
+
+const UNMAPPABLE_DISTANCE = 1.35;
+
+function lookupSpelling(inventory             , token        )                 {
+  const key = token.trim();
+  if (!key) return null;
+  return PHONEMES.find((ph) => ph.spellings[inventory] === key) ?? null;
+}
+
+function mapSequence(sourceInv             , targetInv             , text        )            {
+  const tokens = text
+    .trim()
+    .split(/[\s,/;]+/)
+    .filter(Boolean);
+  return tokens.map((token) => {
+    const src = lookupSpelling(sourceInv, token);
+    if (!src) {
+      return {
+        source: token,
+        target: "—",
+        canonical: "",
+        status: "unknown"         ,
+        confidence: 0,
+        durationDeltaMs: 0,
+        citation: `“${token}” is not in the ${sourceInv} inventory shipped with this bench.`,
+        distance: 99,
+      };
+    }
+    const targetSymbol = src.spellings[targetInv];
+    if (targetSymbol) {
+      return {
+        source: token,
+        target: targetSymbol,
+        canonical: src.id,
+        status: "exact"         ,
+        confidence: 1,
+        durationDeltaMs: 0,
+        citation: src.citation,
+        distance: 0,
+      };
+    }
+    let best                 = null;
+    let bestD = Infinity;
+    for (const candidate of PHONEMES) {
+      if (!candidate.spellings[targetInv]) continue;
+      const dist = featureDistance(src, candidate);
+      if (dist < bestD) {
+        bestD = dist;
+        best = candidate;
+      }
+    }
+    if (!best) {
+      return {
+        source: token,
+        target: "—",
+        canonical: src.id,
+        status: "unmappable"         ,
+        confidence: 0,
+        durationDeltaMs: 0,
+        citation: src.citation,
+        distance: 99,
+      };
+    }
+    const confidence = Math.max(0, Math.min(0.92, 1 - bestD / 3.4));
+    const unmappable = bestD > UNMAPPABLE_DISTANCE;
+    return {
+      source: token,
+      target: best.spellings[targetInv] ?? "—",
+      canonical: src.id,
+      status: unmappable ? ("unmappable"         ) : ("substituted"         ),
+      confidence: unmappable ? Math.min(confidence, 0.35) : confidence,
+      durationDeltaMs: best.durationMs - src.durationMs,
+      citation: `${src.citation} Nearest ${targetInv} symbol by place/manner/voicing distance ${bestD.toFixed(2)}.`,
+      distance: bestD,
+    };
+  });
+}
+
+function inventorySymbols(id             )           {
+  return PHONEMES.map((ph) => ph.spellings[id]).filter((s)              => Boolean(s));
+}
+
+
+// ---- render.ts ----
+/** PSOLA / WSOLA renders, house-score synthesis, note extraction, MIDI. */
+
+
+
+function psolaRender(opts   
+                      
+                     
+                
+                    
+                                       
+                                               
+ )               {
+  const { input, sampleRate, f0 } = opts;
+  const outLength = Math.max(1, opts.outLength | 0);
+  const out = new Float32Array(outLength);
+  const norm = new Float32Array(outLength);
+  const marks = buildMarks(input.length, sampleRate, f0);
+  let outPos = 0;
+  let guard = 0;
+  while (outPos < outLength - 2 && guard++ < outLength) {
+    const mapped = opts.mapIn(outPos);
+    const inPos = Number.isFinite(mapped) ? Math.max(0, Math.min(input.length - 2, mapped)) : 0;
+    const rawF = f0At(f0, inPos / sampleRate);
+    const freq = Number.isFinite(rawF) ? rawF : 0;
+    const voiced = freq > 55 && freq < 1100;
+    const analysisPeriod = voiced ? sampleRate / freq : sampleRate * 0.01;
+    let ratio = 1;
+    if (voiced) {
+      const requested = opts.pitchRatioAtIn(inPos);
+      ratio = Number.isFinite(requested) ? Math.min(2.6, Math.max(0.5, requested)) : 1;
+    }
+    const targetPeriod = Math.min(sampleRate * 0.025, Math.max(16, analysisPeriod / ratio));
+    const mark = nearestMark(marks, inPos);
+    const grainLen = Math.round(Math.min(sampleRate * 0.05, Math.max(48, analysisPeriod * 2, targetPeriod * 2)));
+    const half = grainLen >> 1;
+    const base = Math.round(outPos);
+    for (let k = -half; k < grainLen - half; k++) {
+      const ip = mark + k;
+      const op = base + k;
+      if (ip < 0 || op < 0 || ip >= input.length || op >= outLength) continue;
+      const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * (k + half)) / grainLen);
+      out[op] += input[ip] * w;
+      norm[op] += w;
+    }
+    outPos += targetPeriod;
+  }
+  for (let i = 0; i < outLength; i++) {
+    if (norm[i] > 1e-4) out[i] /= norm[i];
+  }
+  const fade = Math.min(Math.round(sampleRate * 0.008), Math.floor(outLength / 4));
+  for (let i = 0; i < fade; i++) {
+    const g = i / Math.max(1, fade);
+    out[i] *= g;
+    out[outLength - 1 - i] *= g;
+  }
+  return out;
+}
+
+function buildMarks(length        , sampleRate        , f0           )           {
+  const marks           = [];
+  let cursor = 0;
+  let guard = 0;
+  while (cursor < length - 8 && guard++ < length) {
+    const freq = f0At(f0, cursor / sampleRate);
+    const period = freq > 55 && freq < 1100 ? sampleRate / freq : sampleRate * 0.01;
+    const step = Math.max(16, Math.round(Math.min(sampleRate * 0.02, period)));
+    const next = marks.length === 0 ? step : marks[marks.length - 1] + step;
+    if (next >= length - 1) break;
+    marks.push(next);
+    cursor = next;
+  }
+  return marks;
+}
+
+function nearestMark(marks          , pos        )         {
+  if (!marks.length) return Math.max(0, Math.round(pos));
+  let lo = 0;
+  let hi = marks.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (marks[mid] < pos) lo = mid + 1;
+    else hi = mid;
+  }
+  const a = marks[Math.max(0, lo - 1)];
+  const b = marks[lo];
+  return Math.abs(a - pos) <= Math.abs(b - pos) ? a : b;
+}
+
+function wsolaToLength(input              , outLength        )               {
+  if (input.length < 128 || outLength < 128) {
+    const out = new Float32Array(Math.max(1, outLength));
+    const step = (input.length - 1) / Math.max(1, out.length - 1);
+    for (let i = 0; i < out.length; i++) out[i] = interp(input, i * step);
+    return out;
+  }
+  const win = 256;
+  const synHop = 128;
+  const anaHop = synHop / Math.max(0.25, outLength / input.length);
+  const out = new Float32Array(outLength);
+  const norm = new Float32Array(outLength);
+  let ana = 0;
+  let syn = 0;
+  let guard = 0;
+  while (syn + win < outLength && ana + win < input.length && guard++ < outLength) {
+    for (let i = 0; i < win; i++) {
+      const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (win - 1));
+      out[syn + i] += input[ana + i] * w;
+      norm[syn + i] += w;
+    }
+    const nextSyn = syn + synHop;
+    const ideal = ana + anaHop;
+    let best = Math.round(ideal);
+    let bestScore = -1e18;
+    const from = Math.max(0, Math.round(ideal - 40));
+    const to = Math.min(input.length - win - 1, Math.round(ideal + 40));
+    for (let pos = from; pos <= to; pos += 2) {
+      let c = 0;
+      let e = 1e-8;
+      for (let i = 0; i < win - synHop; i += 2) {
+        const o = nextSyn + i;
+        if (o >= outLength || norm[o] < 1e-5) continue;
+        const cand = input[pos + i];
+        c += (out[o] / norm[o]) * cand;
+        e += cand * cand;
+      }
+      const score = c / Math.sqrt(e);
+      if (score > bestScore) {
+        bestScore = score;
+        best = pos;
+      }
+    }
+    ana = Math.max(0, Math.min(input.length - win - 1, best));
+    syn = nextSyn;
+  }
+  for (let i = 0; i < outLength; i++) {
+    if (norm[i] > 1e-4) out[i] /= norm[i];
+    else out[i] = interp(input, (i / Math.max(1, outLength - 1)) * (input.length - 1));
+  }
+  return out;
+}
+
+function naivePitchShift(input              , semitones        )               {
+  const ratio = 2 ** (semitones / 12);
+  const shortLen = Math.max(32, Math.round(input.length / ratio));
+  const short = new Float32Array(shortLen);
+  for (let i = 0; i < shortLen; i++) short[i] = interp(input, i * ratio);
+  return wsolaToLength(short, input.length);
+}
+
+function sampleSeries(values              , x        )         {
+  if (x <= 0) return values[0];
+  const last = values.length - 1;
+  if (x >= last) return values[last];
+  const i = Math.floor(x);
+  const f = x - i;
+  return values[i] * (1 - f) + values[i + 1] * f;
+}
+
+/** Constant-ratio pitch shift that pins the cepstral envelope (formants) unless asked to move it. */
+function spectralPitchShift(
+  input              ,
+  sampleRate        ,
+  semitones        ,
+  formantSemitones = 0,
+)               {
+  const nfft = 1024;
+  const hop = 256;
+  const pitchR = 2 ** (semitones / 12);
+  const formantR = 2 ** (formantSemitones / 12);
+  const out = new Float32Array(input.length);
+  const norm = new Float32Array(input.length);
+  const phase = new Float64Array(nfft / 2 + 1);
+  const lifter = 30;
+  for (let start = 0; start + nfft <= input.length; start += hop) {
+    const re = new Float64Array(nfft);
+    const im = new Float64Array(nfft);
+    for (let i = 0; i < nfft; i++) {
+      const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (nfft - 1));
+      re[i] = input[start + i] * w;
+    }
+    fft(re, im, false);
+    const mag = new Float64Array(nfft / 2 + 1);
+    for (let k = 0; k < mag.length; k++) mag[k] = Math.hypot(re[k], im[k]) + 1e-10;
+    const logMag = new Float64Array(nfft);
+    for (let k = 0; k < mag.length; k++) {
+      const v = Math.log(mag[k]);
+      logMag[k] = v;
+      if (k > 0 && k < nfft / 2) logMag[nfft - k] = v;
+    }
+    const cim = new Float64Array(nfft);
+    fft(logMag, cim, true);
+    for (let i = lifter; i <= nfft - lifter; i++) {
+      logMag[i] = 0;
+      cim[i] = 0;
+    }
+    fft(logMag, cim, false);
+    const env = new Float64Array(mag.length);
+    for (let k = 0; k < env.length; k++) env[k] = Math.exp(logMag[k]);
+    const nre = new Float64Array(nfft);
+    const nim = new Float64Array(nfft);
+    for (let k = 0; k < mag.length; k++) {
+      const src = k / pitchR;
+      const residual = sampleSeries(mag, src) / Math.max(1e-8, sampleSeries(env, src));
+      const shaped = residual * sampleSeries(env, k / formantR);
+      phase[k] += (2 * Math.PI * hop * k) / nfft;
+      const c = Math.cos(phase[k]);
+      const s = Math.sin(phase[k]);
+      nre[k] = shaped * c;
+      nim[k] = shaped * s;
+      if (k > 0 && k < nfft / 2) {
+        nre[nfft - k] = nre[k];
+        nim[nfft - k] = -nim[k];
+      }
+    }
+    fft(nre, nim, true);
+    for (let i = 0; i < nfft; i++) {
+      const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (nfft - 1));
+      const o = start + i;
+      if (o >= out.length) break;
+      out[o] += nre[i] * w;
+      norm[o] += w * w;
+    }
+  }
+  for (let i = 0; i < out.length; i++) if (norm[i] > 1e-6) out[i] /= norm[i];
+  return peakNormalize(out, 0.85);
+}
+
+function formantLockedShift(
+  input              ,
+  _sampleRate        ,
+  semitones        ,
+  formantSemitones = 0,
+)               {
+  return spectralPitchShift(input, _sampleRate, semitones, formantSemitones);
+}
+
+function deEss(samples              , sampleRate        )               {
+  const out = samples.slice();
+  const hop = Math.max(1, Math.round(sampleRate * 0.01));
+  const hp = new Float32Array(samples.length);
+  const alpha = Math.exp((-2 * Math.PI * 5500) / sampleRate);
+  let prev = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const low = samples[i] + alpha * (prev - samples[i]);
+    hp[i] = samples[i] - low;
+    prev = low;
+  }
+  for (let start = 0; start < samples.length; start += hop) {
+    let full = 0;
+    let high = 0;
+    const end = Math.min(samples.length, start + hop);
+    for (let i = start; i < end; i++) {
+      full += samples[i] * samples[i];
+      high += hp[i] * hp[i];
+    }
+    const ratio = high / (full + 1e-8);
+    if (ratio > 0.28) {
+      const g = Math.max(0.35, 1 - (ratio - 0.28) * 1.8);
+      for (let i = start; i < end; i++) out[i] = samples[i] - hp[i] * (1 - g);
+    }
+  }
+  return out;
+}
+
+function delaySignal(samples              , sampleRate        , delaySec        , wobbleAmp = 0)               {
+  const out = new Float32Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const t = i / sampleRate;
+    const delay = delaySec + wobbleAmp * Math.sin(2 * Math.PI * 0.35 * t);
+    out[i] = interp(samples, i - delay * sampleRate);
+  }
+  return out;
+}
+
+function mixLayers(layers                , gain = 0.7)               {
+  const n = layers.reduce((m, layer) => Math.max(m, layer.length), 0);
+  const out = new Float32Array(n);
+  for (const layer of layers) {
+    for (let i = 0; i < layer.length; i++) out[i] += layer[i];
+  }
+  return peakNormalize(out, gain);
+}
+
+                            
+                
+              
+               
+                     
+                                       
+                                                         
+ 
+
+                             
+                
+              
+                     
+ 
+
+function midiOf(freq        )         {
+  return 69 + 12 * Math.log2(freq / 440);
+}
+
+function segmentNotes(frames           )              {
+  const notes              = [];
+  let current                                                                                           = null;
+  const flush = (endTime        ) => {
+    if (!current || endTime - current.start < 0.08 || current.cents.length < 3) {
+      current = null;
+      return;
+    }
+    let mean = 0;
+    for (const c of current.cents) mean += c;
+    mean /= current.cents.length;
+    const residual = current.cents.map((c) => c - mean);
+    let crossings = 0;
+    for (let i = 1; i < residual.length; i++) {
+      if ((residual[i - 1] <= 0 && residual[i] > 0) || (residual[i - 1] >= 0 && residual[i] < 0)) crossings++;
+    }
+    const dt =
+      current.times.length > 1
+        ? (current.times[current.times.length - 1] - current.times[0]) / (current.times.length - 1)
+        : 0.01;
+    const rate = dt > 0 ? crossings / 2 / (residual.length * dt) : 0;
+    let rss = 0;
+    for (const c of residual) rss += c * c;
+    const depth = Math.sqrt(rss / residual.length) * Math.SQRT2;
+    const vibrato = rate >= 3.5 && rate <= 8.5 && depth >= 18 ? { rateHz: rate, depthCents: depth } : null;
+    notes.push({
+      start: current.start,
+      end: endTime,
+      midi: current.midi,
+      confidence: current.conf.reduce((s, v) => s + v, 0) / current.conf.length,
+      bend: current.times
+        .map((t, idx) => ({ t, cents: Math.max(-200, Math.min(200, current .cents[idx] - mean)) }))
+        .filter((_, idx) => idx % 2 === 0),
+      vibrato,
+    });
+    current = null;
+  };
+  for (const frame of frames) {
+    if (frame.f0 <= 0) {
+      if (current) flush(frame.time);
+      continue;
+    }
+    const midi = Math.round(midiOf(frame.f0));
+    const cents = (midiOf(frame.f0) - midi) * 100;
+    if (!current) {
+      current = { start: frame.time, midi, cents: [cents], times: [frame.time], conf: [frame.confidence] };
+      continue;
+    }
+    if (Math.abs(midiOf(frame.f0) - current.midi) > 0.7) {
+      flush(frame.time);
+      current = { start: frame.time, midi, cents: [cents], times: [frame.time], conf: [frame.confidence] };
+    } else {
+      current.cents.push((midiOf(frame.f0) - current.midi) * 100);
+      current.times.push(frame.time);
+      current.conf.push(frame.confidence);
+    }
+  }
+  if (current && frames.length) flush(frames[frames.length - 1].time + 0.01);
+  return notes;
+}
+
+function detectBreaths(samples              , sampleRate        , frames           )               {
+  const spans               = [];
+  let run                                                 = null;
+  for (const frame of frames) {
+    const sample = Math.round(frame.time * sampleRate);
+    const flat = spectralFlatnessFrame(samples, Math.max(0, sample - 256), 512);
+    const breathy = frame.f0 <= 0 && frame.energy > 0.008 && flat > 0.32;
+    if (breathy) {
+      if (!run) run = { t0: frame.time, flat: 0, n: 0 };
+      run.flat += flat;
+      run.n++;
+    } else if (run) {
+      if (frame.time - run.t0 > 0.05) spans.push({ start: run.t0, end: frame.time, confidence: Math.min(1, run.flat / run.n) });
+      run = null;
+    }
+  }
+  return spans;
+}
+
+function dynamicsCurve(frames           )                                 {
+  let peak = 1e-6;
+  for (const frame of frames) peak = Math.max(peak, frame.energy);
+  return frames.map((frame) => ({ t: frame.time, value: Math.min(1, frame.energy / peak) }));
+}
+
+function vlq(value        )           {
+  let v = Math.max(0, value | 0);
+  const bytes = [v & 0x7f];
+  v >>= 7;
+  while (v > 0) {
+    bytes.unshift((v & 0x7f) | 0x80);
+    v >>= 7;
+  }
+  return bytes;
+}
+
+function encodeMidi(notes             , bpm = 96)             {
+  const tpq = 480;
+  const secToTick = (s        ) => Math.max(0, Math.round((s * bpm * tpq) / 60));
+  const uspq = Math.round(60000000 / bpm);
+  const events                                     = [
+    { tick: 0, data: [0xff, 0x51, 0x03, (uspq >> 16) & 0xff, (uspq >> 8) & 0xff, uspq & 0xff] },
+    { tick: 0, data: [0xc0, 54] },
+  ];
+  for (const note of notes) {
+    const pitch = Math.max(0, Math.min(127, note.midi));
+    events.push({ tick: secToTick(note.start), data: [0x90, pitch, 86] });
+    for (const bend of note.bend) {
+      const value = Math.max(0, Math.min(16383, Math.round(8192 + (bend.cents / 200) * 8192)));
+      events.push({ tick: secToTick(bend.t), data: [0xe0, value & 0x7f, (value >> 7) & 0x7f] });
+    }
+    events.push({ tick: Math.max(secToTick(note.start) + 1, secToTick(note.end)), data: [0x80, pitch, 0] });
+  }
+  const endTick = events.reduce((m, e) => Math.max(m, e.tick), 0) + tpq;
+  events.push({ tick: endTick, data: [0xff, 0x2f, 0x00] });
+  events.sort((a, b) => a.tick - b.tick || a.data[0] - b.data[0]);
+  const track           = [];
+  let last = 0;
+  for (const event of events) {
+    track.push(...vlq(event.tick - last), ...event.data);
+    last = event.tick;
+  }
+  const header = [0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, (tpq >> 8) & 0xff, tpq & 0xff];
+  const len = track.length;
+  const trackHead = [0x4d, 0x54, 0x72, 0x6b, (len >> 24) & 0xff, (len >> 16) & 0xff, (len >> 8) & 0xff, len & 0xff];
+  return Uint8Array.from([...header, ...trackHead, ...track]);
+}
+
+function encodeTextGrid(spans                                              , xmax        )         {
+  const lines = [
+    `File type = "ooTextFile"`,
+    `Object class = "TextGrid"`,
+    ``,
+    `xmin = 0`,
+    `xmax = ${xmax.toFixed(6)}`,
+    `tiers? <exists>`,
+    `size = 1`,
+    `item []:`,
+    `    item [1]:`,
+    `        class = "IntervalTier"`,
+    `        name = "phones"`,
+    `        xmin = 0`,
+    `        xmax = ${xmax.toFixed(6)}`,
+    `        intervals: size = ${spans.length}`,
+  ];
+  spans.forEach((span, index) => {
+    lines.push(
+      `        intervals [${index + 1}]:`,
+      `            xmin = ${span.t0.toFixed(6)}`,
+      `            xmax = ${span.t1.toFixed(6)}`,
+      `            text = "${span.symbol}"`,
+    );
+  });
+  return lines.join("\n");
+}
+
+                             
+                 
+              
+             
+             
+                  
+                      
+             
+             
+             
+                                                                  
+ 
+
+const DEMO_SR = 22050;
+const DEMO_DUR = 6.2;
+
+function houseScore()               {
+  return [
+    { symbol: "T", ipa: "t", t0: 0.18, t1: 0.26, voiced: false, midi: null, f1: 400, f2: 1800, f3: 2800, kind: "burst" },
+    { symbol: "EY", ipa: "eɪ", t0: 0.26, t1: 0.62, voiced: true, midi: 60, f1: 460, f2: 1960, f3: 2680, kind: "vowel" },
+    { symbol: "K", ipa: "k", t0: 0.62, t1: 0.72, voiced: false, midi: null, f1: 500, f2: 1500, f3: 2500, kind: "burst" },
+    { symbol: "AH", ipa: "ʌ", t0: 0.72, t1: 0.98, voiced: true, midi: 64, f1: 680, f2: 1280, f3: 2500, kind: "vowel" },
+    { symbol: "N", ipa: "n", t0: 1.16, t1: 1.28, voiced: true, midi: 64, f1: 320, f2: 1400, f3: 2600, kind: "liquid" },
+    { symbol: "OW", ipa: "oʊ", t0: 1.28, t1: 1.92, voiced: true, midi: 67, f1: 470, f2: 820, f3: 2400, kind: "vowel" },
+    { symbol: "T", ipa: "t", t0: 1.92, t1: 2.0, voiced: false, midi: null, f1: 400, f2: 1800, f3: 2800, kind: "burst" },
+    { symbol: "BR", ipa: "br", t0: 2.12, t1: 2.42, voiced: false, midi: null, f1: 600, f2: 1600, f3: 3000, kind: "breath" },
+    { symbol: "S", ipa: "s", t0: 2.62, t1: 2.86, voiced: false, midi: null, f1: 400, f2: 1800, f3: 4200, kind: "noise" },
+    { symbol: "L", ipa: "l", t0: 2.86, t1: 3.0, voiced: true, midi: 69, f1: 380, f2: 1100, f3: 2700, kind: "liquid" },
+    { symbol: "OW", ipa: "oʊ", t0: 3.0, t1: 3.62, voiced: true, midi: 69, f1: 460, f2: 860, f3: 2400, kind: "vowel" },
+    { symbol: "L", ipa: "l", t0: 3.62, t1: 3.76, voiced: true, midi: 67, f1: 390, f2: 1080, f3: 2680, kind: "liquid" },
+    { symbol: "IY", ipa: "i", t0: 3.76, t1: 4.45, voiced: true, midi: 67, f1: 300, f2: 2280, f3: 3100, kind: "vowel" },
+    { symbol: "HH", ipa: "h", t0: 4.7, t1: 4.82, voiced: false, midi: null, f1: 500, f2: 1600, f3: 2600, kind: "noise" },
+    { symbol: "AA", ipa: "ɑ", t0: 4.82, t1: 5.45, voiced: true, midi: 64, f1: 720, f2: 1180, f3: 2500, kind: "vowel" },
+    { symbol: "R", ipa: "ɹ", t0: 5.45, t1: 5.62, voiced: true, midi: 60, f1: 420, f2: 1100, f3: 1700, kind: "liquid" },
+    { symbol: "T", ipa: "t", t0: 5.62, t1: 5.7, voiced: false, midi: null, f1: 400, f2: 1700, f3: 2800, kind: "burst" },
+  ];
+}
+
+function scoreF0(event            , time        )         {
+  if (!event.voiced || event.midi == null) return 0;
+  const base = 440 * 2 ** ((event.midi - 69) / 12);
+  const dur = Math.max(0.05, event.t1 - event.t0);
+  const u = (time - event.t0) / dur;
+  const scoop = u < 0.14 ? ((0.14 - u) / 0.14) * 0.85 : 0;
+  const vib = dur > 0.32 && u > 0.22 ? Math.sin(2 * Math.PI * 5.15 * (time - event.t0)) * 0.32 : 0;
+  return base * 2 ** ((vib - scoop) / 12);
+}
+
+function eventAt(score              , time        )                    {
+  for (const event of score) if (time >= event.t0 && time < event.t1) return event;
+  return null;
+}
+
+function truthF0(score              , duration        , hop = 0.01)            {
+  const frames            = [];
+  for (let t = hop; t < duration; t += hop) {
+    const event = eventAt(score, t);
+    const f0 = event ? scoreF0(event, t) : 0;
+    frames.push({ time: t, f0, confidence: f0 ? 1 : 0, energy: f0 ? 0.2 : 0 });
+  }
+  return frames;
+}
+
+class Resonator {
+  z1 = 0;
+  z2 = 0;
+  b0 = 0.05;
+  a1 = 0;
+  a2 = 0;
+  set(freq        , bw        , sampleRate        ) {
+    const f = Math.max(60, Math.min(sampleRate * 0.45, freq));
+    const r = Math.exp((-Math.PI * bw) / sampleRate);
+    const theta = (2 * Math.PI * f) / sampleRate;
+    this.a1 = 2 * r * Math.cos(theta);
+    this.a2 = -(r * r);
+    // Unity gain at the centre frequency. The old b0 = (1 - r)^2 left vowels ~40 dB below
+    // the noise events, so the F0 tracker's energy gate discarded every voiced frame.
+    const re = 1 - this.a1 * Math.cos(theta) - this.a2 * Math.cos(2 * theta);
+    const im = this.a1 * Math.sin(theta) + this.a2 * Math.sin(2 * theta);
+    this.b0 = 1 / Math.hypot(re, im);
+  }
+  process(x        )         {
+    const y = this.b0 * x + this.a1 * this.z1 + this.a2 * this.z2;
+    this.z2 = this.z1;
+    this.z1 = y;
+    return y;
+  }
+}
+
+function synthesizeScore(score              , sampleRate = DEMO_SR, duration = DEMO_DUR)               {
+  const n = Math.floor(sampleRate * duration);
+  const y = new Float32Array(n);
+  const rng = mulberry32(0x51ed);
+  const r1 = new Resonator();
+  const r2 = new Resonator();
+  const r3 = new Resonator();
+  let c1 = 500;
+  let c2 = 1500;
+  let c3 = 2500;
+  let phase = 0;
+  let prevG = 0;
+  let prevNoise = 0;
+  let env = 0;
+  r1.set(c1, 90, sampleRate);
+  r2.set(c2, 110, sampleRate);
+  r3.set(c3, 160, sampleRate);
+  for (let i = 0; i < n; i++) {
+    const t = i / sampleRate;
+    const event = eventAt(score, t);
+    const target = !event || event.kind === "gap" ? 0 : event.kind === "breath" ? 0.22 : event.kind === "burst" ? 0.55 : 0.9;
+    env += (target - env) * (target > env ? 0.08 : 0.02);
+    let source = 0;
+    if (event && (event.kind === "noise" || event.kind === "breath" || event.kind === "burst")) {
+      const noise = rng() * 2 - 1;
+      const hp = noise - prevNoise;
+      prevNoise = noise;
+      const burstEnv = event.kind === "burst" ? Math.exp(-(t - event.t0) / 0.018) : 1;
+      source = hp * env * burstEnv * (event.kind === "breath" ? 0.45 : 0.8);
+    }
+    if (event?.voiced) {
+      phase += scoreF0(event, t) / sampleRate;
+      if (phase >= 1) phase -= 1;
+      const open = 0.42;
+      const g =
+        phase < open
+          ? 0.5 * (1 - Math.cos((Math.PI * phase) / open))
+          : 0.5 * (1 + Math.cos((Math.PI * (phase - open)) / (1 - open)));
+      source += (g - prevG) * env * 3.2;
+      prevG = g;
+    } else {
+      prevG *= 0.8;
+      phase = 0;
+    }
+    if (event && (i & 31) === 0) {
+      c1 += (event.f1 - c1) * 0.65;
+      c2 += (event.f2 - c2) * 0.65;
+      c3 += (event.f3 - c3) * 0.65;
+      r1.set(c1, event.kind === "liquid" ? 70 : 95, sampleRate);
+      r2.set(c2, 120, sampleRate);
+      r3.set(c3, 170, sampleRate);
+    }
+    y[i] = event?.voiced ? r1.process(source) * 0.9 + r2.process(source) * 0.38 + r3.process(source) * 0.16 : source * 0.5;
+  }
+  return peakNormalize(y, 0.75);
+}
+
+function refTimeAtProc(tp        )         {
+  return tp + 0.18 * Math.tanh((tp - DEMO_DUR * 0.46) / 0.28) - 0.02;
+}
+
+function procTimeAtRef(tr        )         {
+  let lo = 0;
+  let hi = DEMO_DUR;
+  for (let k = 0; k < 28; k++) {
+    const mid = (lo + hi) / 2;
+    if (refTimeAtProc(mid) < tr) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+                       
+             
+                 
+              
+             
+             
+               
+               
+                  
+                                   
+ 
+
+function spansFromScore(score              , duration        , mapTime                       )         {
+  const spans         = [];
+  let cursor = 0;
+  const pushGap = (t1        ) => {
+    if (t1 - cursor <= 0.03) return;
+    const a = mapTime(cursor);
+    const b = mapTime(t1);
+    spans.push({
+      id: `gap-${spans.length}`,
+      symbol: "·",
+      ipa: "",
+      t0: a,
+      t1: b,
+      src0: a,
+      src1: b,
+      voiced: false,
+      kind: "gap",
+    });
+  };
+  for (const event of score) {
+    pushGap(event.t0);
+    spans.push({
+      id: `${event.symbol}-${spans.length}`,
+      symbol: event.symbol,
+      ipa: event.ipa,
+      t0: mapTime(event.t0),
+      t1: mapTime(event.t1),
+      src0: mapTime(event.t0),
+      src1: mapTime(event.t1),
+      voiced: event.voiced,
+      kind: event.kind,
+    });
+    cursor = event.t1;
+  }
+  pushGap(duration);
+  return spans.map((span) => ({
+    ...span,
+    t0: Math.max(0, Math.min(duration, span.t0)),
+    t1: Math.max(0, Math.min(duration, span.t1)),
+    src0: Math.max(0, Math.min(duration, span.src0)),
+    src1: Math.max(0, Math.min(duration, span.src1)),
+  }));
+}
+
+function sliceStretch(
+  samples              ,
+  sampleRate        ,
+  t0        ,
+  t1        ,
+  outDuration        ,
+  voiced         ,
+  f0           ,
+)               {
+  const a = Math.max(0, Math.min(samples.length - 2, Math.round(t0 * sampleRate)));
+  const b = Math.max(a + 2, Math.min(samples.length, Math.round(t1 * sampleRate)));
+  const piece = samples.subarray(a, b);
+  const outLen = Math.max(8, Math.round(Math.max(0.03, outDuration) * sampleRate));
+  const ratio = outLen / piece.length;
+  if (!voiced || ratio < 0.55 || ratio > 1.8) return wsolaToLength(piece, outLen);
+  const local = f0
+    .filter((frame) => frame.time >= t0 - 0.02 && frame.time <= t1 + 0.02)
+    .map((frame) => ({ ...frame, time: frame.time - t0 }));
+  return psolaRender({
+    input: piece,
+    sampleRate,
+    f0: local.length ? local : trackF0(piece, sampleRate),
+    outLength: outLen,
+    mapIn: (s) => (s * piece.length) / outLen,
+    pitchRatioAtIn: () => 1,
+  });
+}
+
+function renderSpans(samples              , sampleRate        , spans        , f0           )               {
+  const end = spans.reduce((m, span) => Math.max(m, span.t1), 0);
+  const out = new Float32Array(Math.max(8, Math.ceil((end + 0.05) * sampleRate)));
+  for (const span of spans) {
+    const dur = Math.max(0.03, span.t1 - span.t0);
+    const piece = sliceStretch(samples, sampleRate, span.src0, span.src1, dur, span.voiced, f0);
+    const start = Math.round(span.t0 * sampleRate);
+    const fade = Math.min(48, Math.floor(piece.length / 4));
+    for (let i = 0; i < piece.length; i++) {
+      const o = start + i;
+      if (o < 0 || o >= out.length) continue;
+      let g = 1;
+      if (i < fade) g = i / fade;
+      else if (i > piece.length - fade) g = (piece.length - i) / Math.max(1, fade);
+      out[o] += piece[i] * g;
+    }
+  }
+  return peakNormalize(out, 0.85);
+}
+
+function stretchWarning(span      )          {
+  const src = Math.max(1e-3, span.src1 - span.src0);
+  return Math.abs((span.t1 - span.t0) / src - 1) > 0.15;
+}
+
+                             
+                     
+                   
+                          
+                          
+                   
+                   
+                    
+                   
+                    
+                          
+ 
+
+function buildDemo()             {
+  const score = houseScore();
+  const reference = synthesizeScore(score, DEMO_SR, DEMO_DUR);
+  const truth = truthF0(score, DEMO_DUR);
+  const pitchRatio = 2 ** (1.5 / 12);
+  const processed = peakNormalize(
+    psolaRender({
+      input: reference,
+      sampleRate: DEMO_SR,
+      f0: truth,
+      outLength: reference.length,
+      mapIn: (out) => {
+        const tr = refTimeAtProc(out / DEMO_SR);
+        return Math.max(0, Math.min(reference.length - 2, tr * DEMO_SR));
+      },
+      pitchRatioAtIn: (inSample) => (f0At(truth, inSample / DEMO_SR) > 0 ? pitchRatio : 1),
+    }),
+    0.75,
+  );
+  const refF0 = trackF0(reference, DEMO_SR);
+  const procF0 = trackF0(processed, DEMO_SR);
+  let mae = 0;
+  let n = 0;
+  for (const frame of truth) {
+    if (frame.f0 <= 0) continue;
+    let best = Infinity;
+    let match = 0;
+    for (const other of refF0) {
+      const d = Math.abs(other.time - frame.time);
+      if (d < best) {
+        best = d;
+        match = other.f0;
+      }
+    }
+    if (match > 0 && best < 0.02) {
+      mae += Math.abs(1200 * Math.log2(match / frame.f0));
+      n++;
+    }
+  }
+  return {
+    sampleRate: DEMO_SR,
+    duration: DEMO_DUR,
+    reference,
+    processed,
+    truth,
+    refF0,
+    procF0,
+    refSpans: spansFromScore(score, DEMO_DUR, (t) => t),
+    procSpans: spansFromScore(score, DEMO_DUR, procTimeAtRef),
+    trackerMaeCents: n ? mae / n : 0,
+  };
+}
+
+
+const HELIX = { trackF0, analyzeAlignment, buildDemo, formantLockedShift, naivePitchShift, encodeWav, peakNormalize, mapSequence, INVENTORIES, DEMO_SR, DEMO_DUR, f0At };
+
+</script><script>
+const H = HELIX, $ = (id) => document.getElementById(id);
+let demo, ctx, node, rep;
+const W = { f0: 0.4, time: 0.3, mcd: 0.15, boundary: 0.15 };
+function play(samples, sr) {
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  ctx.resume(); stop();
+  const b = ctx.createBuffer(1, samples.length, sr); b.getChannelData(0).set(samples);
+  node = ctx.createBufferSource(); node.buffer = b; node.connect(ctx.destination); node.start();
+}
+function stop() { try { node && node.stop(); } catch (e) {} node = null; }
+function download(samples, sr, name) {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(H.encodeWav(samples, sr)); a.download = name; a.click();
+}
+function drawWave(cv, x, color, f0s) {
+  const c = cv.getContext("2d"), w = cv.width, h = cv.height; c.clearRect(0, 0, w, h);
+  c.strokeStyle = "#2a3347"; c.beginPath(); c.moveTo(0, h / 2); c.lineTo(w, h / 2); c.stroke();
+  c.strokeStyle = color; c.beginPath();
+  const step = Math.max(1, Math.floor(x.length / w));
+  for (let i = 0; i < w; i++) {
+    let mn = 1, mx = -1; for (let j = 0; j < step; j++) { const s = x[i * step + j] || 0; if (s < mn) mn = s; if (s > mx) mx = s; }
+    c.moveTo(i, h / 2 - mx * h / 2); c.lineTo(i, h / 2 - mn * h / 2);
+  } c.stroke();
+  if (f0s) { c.strokeStyle = "#ffcf5a"; c.lineWidth = 2; c.beginPath(); let on = false;
+    for (const fr of f0s) { const px = fr.time / demo.duration * w; if (fr.f0 > 0) { const py = h - Math.min(1, Math.max(0, (Math.log2(fr.f0 / 70)) / 3)) * h; on ? c.lineTo(px, py) : c.moveTo(px, py); on = true; } else on = false; }
+    c.stroke(); c.lineWidth = 1; }
+}
+function runQc() {
+  rep = H.analyzeAlignment({ reference: demo.reference, processed: demo.processed, sampleRate: demo.sampleRate, refF0: demo.refF0, procF0: demo.procF0, weights: W });
+  $("score").textContent = rep.score.toFixed(1);
+  $("f0mae").textContent = rep.f0MaeCents.toFixed(1) + " cents";
+  $("f0corr").textContent = rep.f0Corr.toFixed(3);
+  $("offset").textContent = rep.offsetMs.toFixed(1) + " ms";
+  $("mcd").textContent = rep.mcd.toFixed(2) + " dB";
+  $("boundary").textContent = rep.boundaryMs.toFixed(1) + " ms";
+  $("voiced").textContent = rep.voicedFrames;
+  $("flags").innerHTML = rep.flags.length ? rep.flags.map(f => `<li>${f.t0.toFixed(2)}–${f.t1.toFixed(2)} s: ${f.reason}</li>`).join("") : "<li>no flags</li>";
+}
+function init() {
+  demo = H.buildDemo();
+  $("tracker").textContent = demo.trackerMaeCents.toFixed(1) + " cents";
+  drawWave($("cvRef"), demo.reference, "#5aa9ff", demo.refF0);
+  drawWave($("cvProc"), demo.processed, "#7be0a5", demo.procF0);
+  runQc();
+  for (const k of Object.keys(W)) $("w_" + k).oninput = (e) => { W[k] = parseFloat(e.target.value); $("wv_" + k).textContent = W[k].toFixed(2); runQc(); };
+  $("playRef").onclick = () => play(demo.reference, demo.sampleRate);
+  $("playProc").onclick = () => play(demo.processed, demo.sampleRate);
+  $("stop").onclick = stop;
+  let lastShift = null;
+  const doShift = (locked) => {
+    const st = parseFloat($("st").value), fs = parseFloat($("fs").value);
+    lastShift = locked ? H.formantLockedShift(demo.reference, demo.sampleRate, st, fs) : H.naivePitchShift(demo.reference, st);
+    lastShift = H.peakNormalize(lastShift, 0.8);
+    $("shiftInfo").textContent = `${locked ? "formant-locked" : "naive"} shift ${st > 0 ? "+" : ""}${st} st rendered: ${lastShift.length} samples`;
+    play(lastShift, demo.sampleRate);
+  };
+  $("shiftLock").onclick = () => doShift(true);
+  $("shiftNaive").onclick = () => doShift(false);
+  $("shiftDl").onclick = () => lastShift ? download(lastShift, demo.sampleRate, "helix-shift.wav") : doShift(true);
+  $("st").oninput = (e) => $("stv").textContent = e.target.value; $("fs").oninput = (e) => $("fsv").textContent = e.target.value;
+  for (const i of H.INVENTORIES) for (const id of ["srcInv", "dstInv"]) { const o = document.createElement("option"); o.value = i.id; o.textContent = i.label; $(id).appendChild(o); }
+  $("srcInv").value = "arpabet"; $("dstInv").value = "synthv-ja";
+  const map = () => {
+    const items = H.mapSequence($("srcInv").value, $("dstInv").value, $("phIn").value);
+    $("phOut").innerHTML = items.map(m => `<tr class="${m.status}"><td>${m.source}</td><td>→ ${m.target}</td><td>${m.status}</td><td>${(m.confidence * 100).toFixed(0)}%</td></tr>`).join("");
+  };
+  for (const id of ["srcInv", "dstInv", "phIn"]) $(id).oninput = map; map();
+  document.body.dataset.ready = "1";
+}
+window.addEventListener("DOMContentLoaded", () => { try { init(); } catch (e) { document.body.dataset.error = String(e); document.getElementById("err").textContent = "Error: " + e; throw e; } });
+
+</script></body></html>
